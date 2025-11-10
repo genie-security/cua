@@ -406,16 +406,20 @@ class Qwen3VlConfig(AsyncAgentConfig):
                         "No screenshots found to derive dimensions for coordinate unnormalization."
                     )
                 args = await _unnormalize_coordinate(raw_args, (last_rw, last_rh))
-                tool_calls_for_responses.append(
-                    {
-                        "type": "function",
-                        "id": "call_0",
-                        "function": {
-                            "name": fn_name,
-                            "arguments": json.dumps(args),
-                        },
-                    }
-                )
+                converted = convert_qwen_tool_args_to_computer_action(args) or {}
+                if not converted:
+                    tool_calls_for_responses = []
+                else:
+                    tool_calls_for_responses.append(
+                        {
+                            "type": "function",
+                            "id": "call_0",
+                            "function": {
+                                "name": fn_name,
+                                "arguments": json.dumps(converted),
+                            },
+                        }
+                    )
         else:
             # Provider returned native tool calls; normalize each one.
             message_tool_calls = (choice.get("message") or {}).get("tool_calls") or []
@@ -433,13 +437,16 @@ class Qwen3VlConfig(AsyncAgentConfig):
                         except Exception:
                             args_raw = {}
                     args = await _unnormalize_coordinate(args_raw, (last_rw, last_rh))
+                    converted = convert_qwen_tool_args_to_computer_action(args) or {}
+                    if not converted:
+                        continue
                     tool_calls_for_responses.append(
                         {
                             "type": call.get("type") or "function",
                             "id": call.get("id") or f"call_{idx}",
                             "function": {
                                 "name": func.get("name") or "computer",
-                                "arguments": json.dumps(args),
+                                "arguments": json.dumps(converted),
                             },
                         }
                     )
