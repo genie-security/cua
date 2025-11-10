@@ -235,6 +235,23 @@ def convert_qwen_tool_args_to_computer_action(args: Dict[str, Any]) -> Optional[
 
 @register_agent(models=r"(?i).*qwen.*", priority=-1)
 class Qwen3VlConfig(AsyncAgentConfig):
+    def _initialize_completion_messages(self, using_nous: bool, messages: List[Dict[str, Any]]):
+        converted_msgs = convert_responses_items_to_completion_messages(
+            messages,
+            allow_images_in_tool_results=False,
+        )
+        if using_nous:
+            # Build messages using NousFnCallPrompt system with tool schema in text
+            # Start with converted conversation (images/text preserved)
+
+            # Prepend Nous-generated system if available
+            nous_system = _build_nous_system([QWEN3_COMPUTER_TOOL["function"]])
+            completion_messages = ([nous_system] if nous_system else []) + converted_msgs
+        else:
+            completion_messages = [] + converted_msgs
+
+        return completion_messages
+
     async def predict_step(
         self,
         messages: List[Dict[str, Any]],
@@ -250,16 +267,6 @@ class Qwen3VlConfig(AsyncAgentConfig):
         _on_screenshot=None,
         **kwargs,
     ) -> Dict[str, Any]:
-        # Build messages using NousFnCallPrompt system with tool schema in text
-        # Start with converted conversation (images/text preserved)
-        converted_msgs = convert_responses_items_to_completion_messages(
-            messages,
-            allow_images_in_tool_results=False,
-        )
-
-        # Prepend Nous-generated system if available
-        nous_system = _build_nous_system([QWEN3_COMPUTER_TOOL["function"]])
-        completion_messages = ([nous_system] if nous_system else []) + converted_msgs
 
         # If there is no screenshot in the conversation, take one now and inject it.
         # Also record a pre_output_items assistant message to reflect action.
@@ -271,6 +278,9 @@ class Qwen3VlConfig(AsyncAgentConfig):
                         if isinstance(p, dict) and p.get("type") == "image_url":
                             return True
             return False
+
+        using_nous = model.startswith("dashscope")
+        completion_messages = self._initialize_completion_messages(using_nous, messages)
 
         pre_output_items: List[Dict[str, Any]] = []
         if not _has_any_image(completion_messages):
@@ -353,6 +363,9 @@ class Qwen3VlConfig(AsyncAgentConfig):
             "stream": stream,
             **{k: v for k, v in kwargs.items()},
         }
+        if not using_nous:
+            api_kwargs["tools"] = [QWEN3_COMPUTER_TOOL]
+
         if use_prompt_caching:
             api_kwargs["use_prompt_caching"] = use_prompt_caching
 
@@ -377,7 +390,17 @@ class Qwen3VlConfig(AsyncAgentConfig):
         resp_dict = response.model_dump()  # type: ignore
         choice = (resp_dict.get("choices") or [{}])[0]
         content_text = ((choice.get("message") or {}).get("content")) or ""
-        tool_call = _parse_tool_call_from_text(content_text)
+        if using_nous:
+            tool_call = _parse_tool_call_from_text(content_text)
+        else:
+            tool_calls = (choice.get("message") or {}).get("tool_calls") or []
+            if tool_calls:
+                func = tool_calls[0].get("function") or {}
+                args_json = func.get("arguments") or "{}"
+                func["arguments"] = json.loads(args_json) if isinstance(args_json, str) else args_json
+                tool_call = func  # same structure as the Nous path
+            else:
+                tool_call = None
 
         output_items: List[Dict[str, Any]] = []
         if tool_call and isinstance(tool_call, dict):
