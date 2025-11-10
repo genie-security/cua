@@ -364,7 +364,9 @@ class Qwen3VlConfig(AsyncAgentConfig):
             **{k: v for k, v in kwargs.items()},
         }
         if not using_nous:
+            # DashScope needs the Nous prompt injection. Other providers accept OpenAI-style tools.
             api_kwargs["tools"] = [QWEN3_COMPUTER_TOOL]
+            api_kwargs.setdefault("tool_choice", "auto")
 
         if use_prompt_caching:
             api_kwargs["use_prompt_caching"] = use_prompt_caching
@@ -389,34 +391,22 @@ class Qwen3VlConfig(AsyncAgentConfig):
         # Parse tool call from text; then convert to responses items via fake tool_calls
         resp_dict = response.model_dump()  # type: ignore
         choice = (resp_dict.get("choices") or [{}])[0]
-        content_text = ((choice.get("message") or {}).get("content")) or ""
-        if using_nous:
-            tool_call = _parse_tool_call_from_text(content_text)
-        else:
-            tool_calls = (choice.get("message") or {}).get("tool_calls") or []
-            if tool_calls:
-                func = tool_calls[0].get("function") or {}
-                args_json = func.get("arguments") or "{}"
-                func["arguments"] = json.loads(args_json) if isinstance(args_json, str) else args_json
-                tool_call = func  # same structure as the Nous path
-            else:
-                tool_call = None
-
         output_items: List[Dict[str, Any]] = []
-        if tool_call and isinstance(tool_call, dict):
-            fn_name = tool_call.get("name") or "computer"
-            raw_args = tool_call.get("arguments") or {}
-            # Unnormalize coordinates to actual screen size using last resized dims
-            if last_rw is None or last_rh is None:
-                raise RuntimeError(
-                    "No screenshots found to derive dimensions for coordinate unnormalization."
-                )
-            args = await _unnormalize_coordinate(raw_args, (last_rw, last_rh))
+        content_text = ((choice.get("message") or {}).get("content")) or ""
 
-            # Build an OpenAI-style tool call so we can reuse the converter
-            fake_cm = {
-                "role": "assistant",
-                "tool_calls": [
+        tool_calls_for_responses: List[Dict[str, Any]] = []
+        if using_nous:
+            # Parse <tool_call>{...}</tool_call> output
+            parsed = _parse_tool_call_from_text(content_text)
+            if parsed and isinstance(parsed, dict):
+                fn_name = parsed.get("name") or "computer"
+                raw_args = parsed.get("arguments") or {}
+                if last_rw is None or last_rh is None:
+                    raise RuntimeError(
+                        "No screenshots found to derive dimensions for coordinate unnormalization."
+                    )
+                args = await _unnormalize_coordinate(raw_args, (last_rw, last_rh))
+                tool_calls_for_responses.append(
                     {
                         "type": "function",
                         "id": "call_0",
@@ -425,7 +415,39 @@ class Qwen3VlConfig(AsyncAgentConfig):
                             "arguments": json.dumps(args),
                         },
                     }
-                ],
+                )
+        else:
+            # Provider returned native tool calls; normalize each one.
+            message_tool_calls = (choice.get("message") or {}).get("tool_calls") or []
+            if message_tool_calls:
+                if last_rw is None or last_rh is None:
+                    raise RuntimeError(
+                        "No screenshots found to derive dimensions for coordinate unnormalization."
+                    )
+                for idx, call in enumerate(message_tool_calls):
+                    func = call.get("function") or {}
+                    args_raw = func.get("arguments") or {}
+                    if isinstance(args_raw, str):
+                        try:
+                            args_raw = json.loads(args_raw)
+                        except Exception:
+                            args_raw = {}
+                    args = await _unnormalize_coordinate(args_raw, (last_rw, last_rh))
+                    tool_calls_for_responses.append(
+                        {
+                            "type": call.get("type") or "function",
+                            "id": call.get("id") or f"call_{idx}",
+                            "function": {
+                                "name": func.get("name") or "computer",
+                                "arguments": json.dumps(args),
+                            },
+                        }
+                    )
+
+        if tool_calls_for_responses:
+            fake_cm = {
+                "role": "assistant",
+                "tool_calls": tool_calls_for_responses,
             }
             output_items.extend(convert_completion_messages_to_responses_items([fake_cm]))
         else:
