@@ -18,6 +18,7 @@ from ..responses import (
     make_double_click_item,
     make_drag_item,
     make_failed_tool_call_items,
+    make_function_call_item,
     make_input_image_item,
     make_keypress_item,
     make_left_mouse_down_item,
@@ -666,10 +667,25 @@ def _convert_completion_to_responses_items(response: Any) -> List[Dict[str, Any]
                     if content_item.get("type") == "text":
                         responses_items.append(make_output_text_item(content_item.get("text", "")))
                     elif content_item.get("type") == "tool_use":
-                        # Convert tool use to computer call
+                        # Convert tool use either to a computer call or a generic function call
+                        tool_name = content_item.get("name", "computer")
                         tool_input = content_item.get("input", {})
-                        action_type = tool_input.get("action")
                         call_id = content_item.get("id")
+
+                        if tool_name != "computer":
+                            if isinstance(tool_input, dict):
+                                fn_args = tool_input
+                            else:
+                                try:
+                                    fn_args = json.loads(tool_input or "{}")
+                                except Exception:
+                                    fn_args = {"raw_input": tool_input}
+                            responses_items.append(
+                                make_function_call_item(tool_name, fn_args, call_id=call_id)
+                            )
+                            continue
+
+                        action_type = tool_input.get("action")
 
                         # Action reference:
                         # https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/computer-use-tool#available-actions
@@ -858,7 +874,7 @@ def _convert_completion_to_responses_items(response: Any) -> List[Dict[str, Any]
                         except Exception as e:
                             responses_items.extend(
                                 make_failed_tool_call_items(
-                                    tool_name="computer",
+                                    tool_name=tool_name,
                                     tool_kwargs=tool_input,
                                     error_message=repr(e),
                                     call_id=call_id,
@@ -868,7 +884,8 @@ def _convert_completion_to_responses_items(response: Any) -> List[Dict[str, Any]
     # Handle tool calls (alternative format)
     if hasattr(message, "tool_calls") and message.tool_calls:
         for tool_call in message.tool_calls:
-            if tool_call.function.name == "computer":
+            tool_name = getattr(tool_call.function, "name", "computer")
+            if tool_name == "computer":
                 try:
                     try:
                         args = json.loads(tool_call.function.arguments)
@@ -1353,7 +1370,7 @@ def _convert_completion_to_responses_items(response: Any) -> List[Dict[str, Any]
                     except Exception as e:
                         responses_items.extend(
                             make_failed_tool_call_items(
-                                tool_name="computer",
+                                tool_name=tool_name,
                                 tool_kwargs=args,
                                 error_message=repr(e),
                                 call_id=call_id,
@@ -1363,6 +1380,14 @@ def _convert_completion_to_responses_items(response: Any) -> List[Dict[str, Any]
                     print("Failed to decode tool call arguments")
                     # Skip malformed tool calls
                     continue
+            else:
+                try:
+                    fn_args = json.loads(getattr(tool_call.function, "arguments", "") or "{}")
+                except Exception:
+                    fn_args = {"raw_arguments": getattr(tool_call.function, "arguments", "")}
+                responses_items.append(
+                    make_function_call_item(tool_name, fn_args, call_id=tool_call.id)
+                )
 
     return responses_items
 
