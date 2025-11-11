@@ -7,6 +7,7 @@ Qwen3-VL agent loop implementation using litellm with function/tool calling.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,6 +96,9 @@ QWEN3_COMPUTER_TOOL: Dict[str, Any] = {
         },
     },
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def _build_nous_system(functions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -235,7 +239,12 @@ def convert_qwen_tool_args_to_computer_action(args: Dict[str, Any]) -> Optional[
 
 @register_agent(models=r"(?i).*qwen.*", priority=-1)
 class Qwen3VlConfig(AsyncAgentConfig):
-    def _initialize_completion_messages(self, using_nous: bool, messages: List[Dict[str, Any]]):
+    def _initialize_completion_messages(
+        self,
+        using_nous: bool,
+        messages: List[Dict[str, Any]],
+        extra_function_tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         converted_msgs = convert_responses_items_to_completion_messages(
             messages,
             allow_images_in_tool_results=False,
@@ -243,9 +252,11 @@ class Qwen3VlConfig(AsyncAgentConfig):
         if using_nous:
             # Build messages using NousFnCallPrompt system with tool schema in text
             # Start with converted conversation (images/text preserved)
+            extra_function_tools = extra_function_tools or []
 
             # Prepend Nous-generated system if available
-            nous_system = _build_nous_system([QWEN3_COMPUTER_TOOL["function"]])
+            tool_defs_for_prompt = [QWEN3_COMPUTER_TOOL["function"], *extra_function_tools]
+            nous_system = _build_nous_system(tool_defs_for_prompt)
             completion_messages = ([nous_system] if nous_system else []) + converted_msgs
         else:
             completion_messages = [] + converted_msgs
@@ -279,8 +290,61 @@ class Qwen3VlConfig(AsyncAgentConfig):
                             return True
             return False
 
+        tools = tools or []
+        function_tool_schemas: List[Dict[str, Any]] = []
+        computer_tool_seen = False
+
+        for idx, schema in enumerate(tools):
+            if not isinstance(schema, dict):
+                logger.warning(
+                    "Skipping tool schema at index %d: expected dict, got %s",
+                    idx,
+                    type(schema).__name__,
+                )
+                continue
+
+            schema_type = schema.get("type")
+            if schema_type == "computer":
+                computer_tool_seen = True
+                continue
+
+            if schema_type == "function":
+                function_schema = schema.get("function")
+                if isinstance(function_schema, dict):
+                    function_tool_schemas.append(function_schema)
+                else:
+                    logger.warning(
+                        "Function tool at index %d missing 'function' dict; got %r",
+                        idx,
+                        function_schema,
+                    )
+            else:
+                logger.info(
+                    "Ignoring unsupported tool schema type %r at index %d",
+                    schema_type,
+                    idx,
+                )
+
+        function_tool_payloads = [
+            {"type": "function", "function": fn_schema} for fn_schema in function_tool_schemas
+        ]
+
+        if function_tool_schemas:
+            logger.debug(
+                "Forwarding %d function tool(s) to Qwen: %s",
+                len(function_tool_schemas),
+                [fn.get("name", "<unnamed>") for fn in function_tool_schemas],
+            )
+
+        if not computer_tool_seen:
+            logger.debug(
+                "No computer tool detected in tool schemas; defaulting to bundled Qwen computer tool"
+            )
+
         using_nous = model.startswith("dashscope")
-        completion_messages = self._initialize_completion_messages(using_nous, messages)
+        completion_messages = self._initialize_completion_messages(
+            using_nous, messages, function_tool_schemas
+        )
 
         pre_output_items: List[Dict[str, Any]] = []
         if not _has_any_image(completion_messages):
@@ -365,7 +429,8 @@ class Qwen3VlConfig(AsyncAgentConfig):
         }
         if not using_nous:
             # DashScope needs the Nous prompt injection. Other providers accept OpenAI-style tools.
-            api_kwargs["tools"] = [QWEN3_COMPUTER_TOOL]
+            combined_tools = [*function_tool_payloads, QWEN3_COMPUTER_TOOL]
+            api_kwargs["tools"] = combined_tools
             api_kwargs.setdefault("tool_choice", "auto")
 
         if use_prompt_caching:
