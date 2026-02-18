@@ -97,6 +97,9 @@ async def _map_computer_tool_to_anthropic(computer_tool: Any, tool_version: str)
 
 async def _prepare_tools_for_anthropic(tool_schemas: List[Dict[str, Any]], model: str) -> Tools:
     """Prepare tools for Anthropic API format."""
+    if _is_bedrock_model(model):
+        return await _prepare_tools_for_bedrock(tool_schemas)
+
     tool_config = _get_tool_config_for_model(model)
     anthropic_tools = []
 
@@ -122,10 +125,114 @@ async def _prepare_tools_for_anthropic(tool_schemas: List[Dict[str, Any]], model
     return anthropic_tools
 
 
-def _convert_responses_items_to_completion_messages(messages: Messages) -> List[Dict[str, Any]]:
+async def _map_computer_tool_to_bedrock_function(computer_tool: Any) -> Dict[str, Any]:
+    """Map computer tool to OpenAI-style function schema for Bedrock Converse."""
+    try:
+        width, height = await computer_tool.get_dimensions()
+    except Exception:
+        width, height = 1024, 768
+
+    return {
+        "type": "function",
+        "function": {
+            "name": "computer",
+            "description": (
+                "Control the remote computer. "
+                f"Current display size is {width}x{height}. "
+                "Use action values such as screenshot, left_click, right_click, "
+                "double_click, mouse_move, type, key, scroll, left_click_drag, wait."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "screenshot",
+                            "left_click",
+                            "right_click",
+                            "middle_click",
+                            "double_click",
+                            "mouse_move",
+                            "type",
+                            "key",
+                            "scroll",
+                            "left_click_drag",
+                            "wait",
+                            "left_mouse_down",
+                            "left_mouse_up",
+                        ],
+                    },
+                    "coordinate": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
+                    "start_coordinate": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
+                    "end_coordinate": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
+                    "text": {"type": "string"},
+                    "scroll_direction": {
+                        "type": "string",
+                        "enum": ["up", "down", "left", "right"],
+                    },
+                    "scroll_amount": {"type": "number"},
+                    "display_width_px": {"type": "number"},
+                    "display_height_px": {"type": "number"},
+                    "display_number": {"type": "number"},
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
+
+async def _prepare_tools_for_bedrock(tool_schemas: List[Dict[str, Any]]) -> Tools:
+    """Prepare tools for Bedrock Converse using OpenAI-style function tools."""
+    bedrock_tools = []
+
+    for schema in tool_schemas:
+        if schema["type"] == "computer":
+            bedrock_tools.append(await _map_computer_tool_to_bedrock_function(schema["computer"]))
+        elif schema["type"] == "function":
+            function_schema = schema["function"]
+            bedrock_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": function_schema["name"],
+                        "description": function_schema.get("description", ""),
+                        "parameters": function_schema.get(
+                            "parameters", {"type": "object", "properties": {}}
+                        ),
+                    },
+                }
+            )
+
+    return bedrock_tools
+
+
+def _is_bedrock_model(model: str) -> bool:
+    return model.lower().startswith("bedrock/")
+
+
+def _convert_responses_items_to_completion_messages(
+    messages: Messages, model: str = ""
+) -> List[Dict[str, Any]]:
     """Convert responses_items message format to liteLLM completion format."""
     completion_messages = []
     call_id_to_fn_name = {}
+    is_bedrock = _is_bedrock_model(model)
 
     for message in messages:
         msg_type = message.get("type")
@@ -213,15 +320,23 @@ def _convert_responses_items_to_completion_messages(messages: Messages) -> List[
             call_id = message.get("call_id", "call_1")
             fn_output = message.get("output", "")
             fn_name = call_id_to_fn_name.get(call_id, "computer")
-
-            completion_messages.append(
-                {
-                    "role": "function",
-                    "name": fn_name,
-                    "tool_call_id": call_id,
-                    "content": str(fn_output),
-                }
-            )
+            if is_bedrock:
+                completion_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": str(fn_output),
+                    }
+                )
+            else:
+                completion_messages.append(
+                    {
+                        "role": "function",
+                        "name": fn_name,
+                        "tool_call_id": call_id,
+                        "content": str(fn_output),
+                    }
+                )
 
         elif msg_type == "computer_call":
             # Computer call becomes tool use in assistant message
@@ -260,7 +375,9 @@ def _convert_responses_items_to_completion_messages(messages: Messages) -> List[
                 action_name = (
                     "right_click"
                     if button == "right"
-                    else "middle_click" if button == "wheel" else "left_click"
+                    else "middle_click"
+                    if button == "wheel"
+                    else "left_click"
                 )
                 tool_use_content.append(
                     {
@@ -625,26 +742,52 @@ def _convert_responses_items_to_completion_messages(messages: Messages) -> List[
             call_id = message.get("call_id", "call_1")
 
             if output.get("type") == "input_image":
-                # Screenshot result - convert to OpenAI format with image_url content
+                # Screenshot result for Bedrock: use tool result + user image message.
+                # Bedrock Converse rejects role=function + image_url tool content.
                 image_url = output.get("image_url", "")
-                completion_messages.append(
-                    {
-                        "role": "function",
-                        "name": "computer",
-                        "tool_call_id": call_id,
-                        "content": [{"type": "image_url", "image_url": {"url": image_url}}],
-                    }
-                )
+                if is_bedrock:
+                    completion_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": "[Execution completed. See screenshot below]",
+                        }
+                    )
+                    if image_url and image_url != "[omitted]":
+                        completion_messages.append(
+                            {
+                                "role": "user",
+                                "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+                            }
+                        )
+                else:
+                    completion_messages.append(
+                        {
+                            "role": "function",
+                            "name": "computer",
+                            "tool_call_id": call_id,
+                            "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+                        }
+                    )
             else:
                 # Text result - convert to OpenAI format
-                completion_messages.append(
-                    {
-                        "role": "function",
-                        "name": "computer",
-                        "tool_call_id": call_id,
-                        "content": str(output),
-                    }
-                )
+                if is_bedrock:
+                    completion_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": str(output),
+                        }
+                    )
+                else:
+                    completion_messages.append(
+                        {
+                            "role": "function",
+                            "name": "computer",
+                            "tool_call_id": call_id,
+                            "content": str(output),
+                        }
+                    )
 
     return completion_messages
 
@@ -1089,12 +1232,16 @@ def _convert_completion_to_responses_items(response: Any) -> List[Dict[str, Any]
                             scroll_x = (
                                 amount
                                 if direction == "left"
-                                else -amount if direction == "right" else 0
+                                else -amount
+                                if direction == "right"
+                                else 0
                             )
                             scroll_y = (
                                 amount
                                 if direction == "up"
-                                else -amount if direction == "down" else 0
+                                else -amount
+                                if direction == "down"
+                                else 0
                             )
                             responses_items.append(
                                 make_scroll_item(
@@ -1519,7 +1666,7 @@ class AnthropicHostedToolsConfig(AsyncAgentConfig):
         anthropic_tools = await _prepare_tools_for_anthropic(tools, model)
 
         # Convert responses_items messages to completion format
-        completion_messages = _convert_responses_items_to_completion_messages(messages)
+        completion_messages = _convert_responses_items_to_completion_messages(messages, model=model)
         if use_prompt_caching:
             # First combine messages to reduce number of blocks
             completion_messages = _combine_completion_messages(completion_messages)
@@ -1536,8 +1683,12 @@ class AnthropicHostedToolsConfig(AsyncAgentConfig):
             **kwargs,
         }
 
+        if _is_bedrock_model(model):
+            # Helps Bedrock Converse handle tool-result + image follow-up turns.
+            api_kwargs["assistant_continue_message"] = True
+
         # Add beta header for computer use
-        if anthropic_tools:
+        if anthropic_tools and not _is_bedrock_model(model):
             api_kwargs["headers"] = {"anthropic-beta": tool_config["beta_flag"]}
 
         # Call API start hook
@@ -1670,7 +1821,6 @@ Task: Click {instruction}. Output ONLY a click action on the target element.""",
                 and item.get("type") == "computer_call"
                 and isinstance(item.get("action"), dict)
             ):
-
                 action = item["action"]
                 if action.get("x") and action.get("y"):
                     x = action.get("x")
