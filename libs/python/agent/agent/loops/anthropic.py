@@ -1997,7 +1997,6 @@ class AnthropicHostedToolsConfig(AsyncAgentConfig):
         if is_bedrock:
             # Helps Bedrock Converse handle tool-result + image follow-up turns.
             api_kwargs["assistant_continue_message"] = True
-            api_kwargs["modify_params"] = True
             api_kwargs["num_retries"] = 0
             requested_retries = 3 if max_retries is None else max_retries
             bedrock_retry_attempts = max(requested_retries, BEDROCK_MIN_RETRY_ATTEMPTS)
