@@ -40,14 +40,16 @@ class ImageRetentionCallback(AsyncCallbackHandler):
     def _apply_image_retention(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Apply image retention policy to keep only the N most recent images.
 
-        Removes computer_call_output items with image_url and their corresponding computer_call items,
-        keeping only the most recent N image pairs based on only_n_most_recent_images setting.
+        For older images beyond the retention window, replaces the image_url with
+        "[omitted]" instead of removing the entire action triplet. This preserves
+        the model's memory of what actions were taken (reasoning + computer_call)
+        while reducing token usage from old screenshots.
 
         Args:
             messages: List of message dictionaries
 
         Returns:
-            Filtered list of messages with image retention applied
+            List of messages with old image data replaced by "[omitted]" placeholders
         """
         if self.only_n_most_recent_images is None:
             return messages
@@ -57,7 +59,7 @@ class ImageRetentionCallback(AsyncCallbackHandler):
         for idx, msg in enumerate(messages):
             if msg.get("type") == "computer_call_output":
                 out = msg.get("output")
-                if isinstance(out, dict) and ("image_url" in out):
+                if isinstance(out, dict) and "image_url" in out and out["image_url"] != "[omitted]":
                     output_indices.append(idx)
 
         # Nothing to trim
@@ -67,29 +69,19 @@ class ImageRetentionCallback(AsyncCallbackHandler):
         # Determine which outputs to keep (most recent N)
         keep_output_indices = set(output_indices[-self.only_n_most_recent_images :])
 
-        # Build set of indices to remove in one pass
-        to_remove: set[int] = set()
+        # Replace old image data with "[omitted]" placeholder instead of removing
+        # the entire action triplet. This preserves the model's procedural memory
+        # (what actions were taken and why) while saving context window tokens.
+        result = []
+        for idx, msg in enumerate(messages):
+            if idx in output_indices and idx not in keep_output_indices:
+                # Shallow copy the message to avoid mutating the original
+                omitted_msg = {
+                    **msg,
+                    "output": {**msg["output"], "image_url": "[omitted]"},
+                }
+                result.append(omitted_msg)
+            else:
+                result.append(msg)
 
-        for idx in output_indices:
-            if idx in keep_output_indices:
-                continue  # keep this screenshot and its context
-
-            to_remove.add(idx)  # remove the computer_call_output itself
-
-            # Remove the immediately preceding computer_call with matching call_id (if present)
-            call_id = messages[idx].get("call_id")
-            prev_idx = idx - 1
-            if (
-                prev_idx >= 0
-                and messages[prev_idx].get("type") == "computer_call"
-                and messages[prev_idx].get("call_id") == call_id
-            ):
-                to_remove.add(prev_idx)
-                # Check a single reasoning immediately before that computer_call
-                r_idx = prev_idx - 1
-                if r_idx >= 0 and messages[r_idx].get("type") == "reasoning":
-                    to_remove.add(r_idx)
-
-        # Construct filtered list
-        filtered = [m for i, m in enumerate(messages) if i not in to_remove]
-        return filtered
+        return result
